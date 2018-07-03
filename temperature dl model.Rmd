@@ -1,8 +1,5 @@
 ## RNN for Data Expo
 
-<a target="_blank" href=https://github.com/darrenkeeley/weather_rnn.git>Github page</a>
-<br>
-
 ### Summary
 
 A recurrent neural network was fit to the historical weather dataset from the JSM Data Expo competition.
