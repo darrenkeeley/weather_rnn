@@ -1,0 +1,306 @@
+## RNN for Data Expo
+
+<a target="_blank" href=https://github.com/darrenkeeley/weather_rnn.git>Github page</a>
+<br>
+
+### Summary
+
+A recurrent neural network was fit to the historical weather dataset from the JSM Data Expo competition.
+
+<a target="_blank" href=http://community.amstat.org/stat-computing/data-expo/data-expo-2018>http://community.amstat.org/stat-computing/data-expo/data-expo-2018</a>
+
+Two variables were predicted: Maximum Temperature and Minimum Temperature in a day. The dataset consists for 20 unique weather metrics (temperature, wind, and precipitation for example), and then two variables representing the date and city.
+
+Six models were fit for each response variable representing six different forecast distances: 1 day out, 2 days out, 3 days out, 4 days out, 5 days out and 6 days out. In total, twelve models were fit. 
+
+The following table shows the National Weather Service's (NWS) prediction errors compared to the recurrent neural network's (RNN), as measured by Mean Absolute Error (MAE). These values were calculated with normalized data. The range of the real values is about 2.5 to 7.5. The RNN has approximately 30% larger errors than the national weather service.
+
+
+| Model/Days out | 1      | 2      | 3      | 4      | 5      | 6      |
+|----------------|--------|--------|--------|--------|--------|--------|
+| NWS Max Temp   | 0.2702 | 0.3468 | 0.3711 | 0.3777 | 0.3736 | 0.3673 |
+| RNN Max Temp   | 0.3810 | 0.4486 | 0.4753 | 0.4944 | 0.4503 | 0.4860 |
+| NWS Min Temp   | 0.3009 | 0.3434 | 0.3551 | 0.3527 | 0.3477 | 0.3309 |
+| RNN Min Temp   | 0.3174 | 0.4431 | 0.4762 | 0.4705 | 0.4848 | 0.4484 |
+
+
+Next steps:
+
+1) Making the whole process a function.
+
+2) Test different model structures.
+
+3) Model precipitation.
+
+This notebook is a retooling of an example from Chollet's Deep Learning with R.
+
+<br>
+
+### Import dataset and tidy up NA's
+
+For now, just omit missing values. We'll figure out how to deal with them later.
+
+```{r, eval=F}
+library(tidyverse); library(data.table); library(keras); library(zoo)
+weather <- fread("data/weather_export2.csv")
+weather$target_date <- as.Date(weather$target_date)
+weather <- na.omit(weather)
+
+weather_nn <- fread("data/weather_nn.csv") # just historical data
+weather_nn <- na.omit(weather_nn) # he Carlsbad outlier had an NA for gust and is removed
+weather_nn$Date <- as.Date(weather_nn$Date)
+```
+
+<br>
+
+### Calculate Baseline
+
+As part of the challenge, we were given forecasts from the National Weather Service. These forecasts will serve as the baseline for the RNN.
+
+First, calculate AE for max and min temps. Then calculate baseline (MAE).
+
+```{r, eval=F}
+# Calculate Absolute Error (AE) for MaxTemp and MinTemp
+weather2 <- weather %>% 
+  mutate(AE_maxtemp = abs(MaxTemp - MaxTemp_forecast), AE_mintemp = abs(MinTemp - MinTemp_forecast))
+
+# Calculate MAE
+weather2 <- as.data.table(weather2)
+MAE_by_do <- weather2[,j=list(mean_maxtemp=mean(AE_maxtemp),sd_maxtemp=sd(AE_maxtemp),
+                              mean_mintemp=mean(AE_mintemp), sd_mintemp=sd(AE_mintemp)),by=Days_out]
+```
+
+We should have a scaled version as well.
+
+```{r, eval=F}
+# Use weather2 so that the AE outliers are already removed.
+scaled_half <- as.data.table(scale(weather2[,-c(1:3,7,28:30)])) 
+
+weather_norm <- cbind(weather2[,c(1:3,7,28)], scaled_half)
+
+weather_norm <- weather_norm %>% 
+  mutate(AE_maxtemp = abs(MaxTemp - MaxTemp_forecast), AE_mintemp = abs(MinTemp - MinTemp_forecast)) %>% 
+  as.data.table()
+
+
+MAE_by_do_norm <- weather_norm[,j=list(mean_maxtemp=mean(AE_maxtemp),sd_maxtemp=sd(AE_maxtemp),
+                                       mean_min_temp=mean(AE_mintemp),sd_mintemp=sd(AE_mintemp)),by=Days_out]
+```
+
+<br>
+
+### Prepare Data
+
+Scale data
+
+```{r, eval=F}
+scaled_half <- scale(weather_nn[,-c(1,2,3,23)])
+weather_nn_norm <- cbind(weather_nn[,c(2,3)], scaled_half)
+```
+
+Training, Validation, Testing sets
+Data goes from 2014-07-01 to 2017-09-01
+```{r, eval=F}
+weather_nn_norm$Date <- as.Date(weather_nn_norm$Date)
+
+train <- filter(weather_nn_norm, Date < "2015-09-01")
+train$Date <- as.Date(train$Date)
+
+valid <- filter(weather_nn_norm, Date >="2015-09-01", Date < "2016-09-01")
+valid$Date <- as.Date(valid$Date)
+
+test <- filter(weather_nn_norm, Date >= "2016-09-01")
+test$Date <- as.Date(test$Date)
+```
+
+<br>
+
+### Generator
+
+The generator will produce batches of a specified size, where each element in a batch is two weeks worth of observed (historical) weather data and a label. The label is MaxTemp that is observed "delay" days after the last historical observation. So if delay = 3, then the fn will return 2 weeks worth of obs (14 obs) that occured 3 days before the label.
+
+The fn also cycles through cities so that the two weeks + label are all from the same city. Unfortunately, this means the last few days of every city often aren't returned by the function. As such, smaller batch sizes allow for more of the last days to be used, but at the cost of much higher training time.
+
+To change the variable to be predicted, look to the bottom of gen_by_city. Change the column index of the targets object.
+
+```{r, eval=F}
+gen_by_city <- function(weather_data, lookback, delay, batch_size){
+  cities <- unique(weather_data$city)
+  
+  # Row index. Used to calculate variable "rows"
+  i <- 1 + lookback
+  
+  # City index
+  j <- 1
+  city_data <- filter(weather_data, city == cities[j])[,-c(1,2)]
+  max_index <- nrow(city_data)
+  
+  function(){
+    # First, check if end of data or cities are reached.
+    # If end of data for 1 city is reached, go to next city.
+    # Cycle through cities
+    if (i + batch_size-1 >= max_index) {
+      i <<- 1 + lookback
+      if (j == length(cities)) {
+        j <<- 1
+        city_data <- filter(weather_data, city == cities[j])[,-c(1,2)]
+        max_index <- nrow(city_data)
+      }
+      else {
+        j <<- j + 1
+        city_data <- filter(weather_data, city == cities[j])[,-c(1,2)]
+        max_index <- nrow(city_data)
+      }
+    }
+    
+    # Second, update parameters for building arrays of data
+    # target rows
+    rows <- c(i:(i+batch_size-1))
+    
+    # update i for next iteration
+    i <<- i+length(rows)
+    
+    # Fourth, set up empty arrays, [length, height, width]
+    # [batch_ele, obs, var]
+    # Remove city column from weather_data
+    samples <- array(0, dim = c(length(rows), lookback,
+                                dim(weather_data[,-c(1,2)])[2]))
+    
+    targets <- array(0, dim = c(length(rows)))
+    
+    # Fifth, populate arrays
+    for (k in 1:length(rows)) {
+      # indices are the sample rows
+      indices <- seq(from=rows[[k]] - lookback, to=rows[[k]]-1) # 1 too long, should be 14 not 15
+      
+      samples[k,,] <- as.matrix(city_data[indices,])
+      #targets[[k]] <- as.matrix(y[rows[[k]] + delay-1, 2]) # test
+      targets[[k]] <- as.matrix(city_data[rows[[k]]+delay-1,  1 ]) # Select column index to be predicted here.
+      # 1 is MaxTemp, 2 is MinTemp
+    }
+    
+    # Sixth, return arrays
+    list(samples, targets)
+  }
+}
+```
+
+<br>
+
+### Training the Model
+
+Set up generators. Give each generator a separate dataset. Different approach than book.
+
+Start here when training a new model. Six models are trained by manually changing "delay" in the generators above. Evaluate and then save each model.
+
+```{r, eval=F}
+lookback <- 14
+delay <- 6
+batch_size <- 16 # Smaller may be better so that last days aren't always skipped.
+
+train_gen <- gen_by_city(
+  train,
+  lookback = lookback,
+  delay = delay,
+  batch_size = batch_size
+)
+
+val_gen <- gen_by_city(
+  valid,
+  lookback = lookback,
+  delay = delay,
+  batch_size = batch_size
+)
+
+test_gen <- gen_by_city(
+  test,
+  lookback = lookback,
+  delay = delay,
+  batch_size = batch_size
+)
+
+# This is how many steps to draw from `val_gen`
+# in order to see the whole validation set:
+val_steps <- (nrow(valid) - lookback) / batch_size
+
+  # This is how many steps to draw from `test_gen`
+# in order to see the whole test set:
+test_steps <- (nrow(test) - lookback) / batch_size
+```
+
+```{}
+# test
+
+for (i in 1:782){
+  x <- val_gen()
+}
+```
+
+Model structure is one gated recurrent layer with 32 hidden nodes and one dense layer as the output layer. Loss function is MAE. Takes about 15 minutes to fit. Using GPU's did not speed up training time, and in fact was a bit slower. It needs investigation. 
+
+```{r, eval=F}
+model <- keras_model_sequential() %>% 
+  layer_gru(units = 32, input_shape = list(NULL, dim(train[,-c(1,2)])[[2]])) %>% 
+  layer_dense(units = 1)
+
+model %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "mae"
+)
+
+history <- model %>% fit_generator(
+  train_gen,
+  steps_per_epoch = 3000,
+  epochs = 10,
+  validation_data = val_gen,
+  validation_steps = val_steps
+)
+
+plot(history)
+```
+
+```{r, eval=F}
+# MaxTemp model for 1 day out: MaxTempD1.h5
+# MinTemp model for 2 days out: MinTempD2.h5
+model %>% save_model_hdf5("MaxTempD6.h5")
+```
+
+<br>
+
+### Evaluating Model
+
+Approximately 2200 batches must be passed through the model for all obs to be seen. The MAE for each batch is averaged together to get the overall MAE for a model.
+
+```{r, eval=F}
+results <- c()
+for (i in 1:2200){
+  test2 <- test_gen()
+  results <- c(results, model %>% evaluate(test2[[1]], test2[[2]]))
+}
+mean(results)
+```
+
+Evaluating saved models. Remember to reassign "delay" in test generator when loading a new model.
+
+```{r, results='hide', eval=F}
+ModelDos <- load_model_hdf5("MaxTempD1.h5")
+
+results <- c()
+for (i in 1:2200){
+  test2 <- test_gen()
+  results <- c(results, ModelDos %>% evaluate(test2[[1]], test2[[2]]))
+}
+
+mean(results)
+```
+
+Storing MAE's for each model.
+
+```{r, eval=F}
+rnn_maxtemp_mae <- c(do1=0.3809964, do2=0.4486441, do3=0.475319, do4=0.4944117, do5=0.4502918, do6=0.4860461)
+rnn_mintemp_mae <- c(do1=0.3173522, do2=0.4431272, do3=0.4762087, do4=0.4704858, do5=0.4847754, do6=0.4484431)
+
+round(rnn_mintemp_mae, 4)
+```
+
+<br>

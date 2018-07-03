@@ -1,0 +1,27 @@
+old model with fixed batch size
+pics
+rsconnect
+variable batch size model
+1 exporting just historical for nn.RMD
+2 aggregating dataset for map WITH DAYS_OUT.rmd
+finish later.pdn
+map generator WITH DAYS_OUT.rmd
+temperature_dl_model.html
+weather data progress report.pptx
+data/Description.txt
+data/forecast.dat
+data/histWeather.csv
+data/locations.csv
+data/MYC.csv
+data/MYC2.csv
+data/MYC_days_out1.csv
+data/MYC_days_out2.csv
+data/MYC_days_out3.csv
+data/MYC_days_out4.csv
+data/MYC_days_out5.csv
+data/MYC_days_out6.csv
+statesp020.dbf
+statesp020.shp
+statesp020.shx
+statesp020.txt
+weather_export.csv
